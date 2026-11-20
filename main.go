@@ -3,9 +3,11 @@ package main
 import (
 	"embed"
 	"fmt"
+	"html"
 	"log/slog"
 	"math/rand"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -32,6 +34,11 @@ var (
 	version = "unknown"
 	commit  = "00000000"
 	date    = "unknown"
+
+	reBlockquote = regexp.MustCompile(`(?is)<blockquote[^>]*>(.*?)</blockquote>`)
+	reBoldMD     = regexp.MustCompile(`\*\*(.+?)\*\*`)
+	reHTMLTags   = regexp.MustCompile(`<[^>]+>`)
+	reSpaces     = regexp.MustCompile(`[ \t]{2,}`)
 )
 
 //go:embed migrations/*.sql
@@ -162,7 +169,6 @@ func listenForMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.Telegram
 				}
 
 				// Select a random entry from the list
-
 				if err := sendMsg(bot, chatID, secret, unreadEntries.Entries[rand.Intn(len(unreadEntries.Entries))], false, false, store); err != nil {
 					slog.Error("Failed sending message for random entry", "error", err)
 				}
@@ -173,6 +179,7 @@ func listenForMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.Telegram
 				}
 			}
 		}
+
 		// Check whether we've got a Callback Query
 		if update.CallbackQuery != nil {
 
@@ -310,16 +317,27 @@ func sendText(bot *tgbotapi.BotAPI, chatID int64, msgStr string, silentMessage b
 }
 
 func sendMsg(bot *tgbotapi.BotAPI, chatID int64, secret types.TelegramSecret, entry *miniflux.Entry, silentMessage bool, deleteRead bool, store store.Store) error {
-	msg := tgbotapi.NewMessage(chatID,
-		fmt.Sprintf("*%s*\n%s in %s\n%s",
-			escapeText("ModeMarkdownV2", entry.Title),
-			escapeText("ModeMarkdownV2", entry.Feed.Title),
-			escapeText("ModeMarkdownV2", entry.Feed.Category.Title),
-			escapeText("ModeMarkdownV2", entry.URL),
-		),
-	)
+	summary := extractAISummary(entry.Content)
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "<b>%s</b>\n", html.EscapeString(entry.Title))
+	fmt.Fprintf(&sb, "<i>%s in %s</i>\n", html.EscapeString(entry.Feed.Title), html.EscapeString(entry.Feed.Category.Title))
+
+	if summary != "" {
+		fmt.Fprintf(&sb, "\n%s\n", summary)
+	}
+
+	fmt.Fprintf(&sb, "\n<a href=\"%s\">%s</a>", html.EscapeString(entry.URL), html.EscapeString(entry.URL))
+
+	msgText := sb.String()
+	runes := []rune(msgText)
+	if len(runes) > 4000 {
+		msgText = string(runes[:4000]) + "…"
+	}
+
+	msg := tgbotapi.NewMessage(chatID, msgText)
 	msg.ReplyMarkup = generateKeyboard(entry, secret)
-	msg.ParseMode = "MarkdownV2"
+	msg.ParseMode = "HTML"
 	msg.DisableNotification = silentMessage
 	message, err := bot.Send(msg)
 	if err != nil {
@@ -338,6 +356,36 @@ func sendMsg(bot *tgbotapi.BotAPI, chatID int64, secret types.TelegramSecret, en
 	}
 
 	return nil
+}
+
+func extractAISummary(content string) string {
+	match := reBlockquote.FindStringSubmatch(content)
+	if len(match) < 2 {
+		return ""
+	}
+
+	// Decodifica entidades HTML como &#34; -> "
+	s := html.UnescapeString(match[1])
+
+	// Quita etiquetas HTML existentes (p, strong, etc.) dejando espacios limpios
+	s = reHTMLTags.ReplaceAllString(s, " ")
+
+	// Escapa caracteres especiales para HTML de Telegram
+	s = html.EscapeString(s)
+
+	// Convierte **negrita** en <b>negrita</b> (reEscapedBold evita que escape interno rompa los asteriscos)
+	s = reBoldMD.ReplaceAllString(s, "<b>$1</b>")
+
+	// Limpia espacios múltiples y recorta
+	s = reSpaces.ReplaceAllString(s, " ")
+	s = strings.TrimSpace(s)
+
+	runes := []rune(s)
+	if len(runes) > 2500 {
+		s = string(runes[:2500]) + "…"
+	}
+
+	return s
 }
 
 func generateKeyboard(entry *miniflux.Entry, secret types.TelegramSecret) tgbotapi.InlineKeyboardMarkup {
@@ -396,34 +444,6 @@ func updateKeyboard(bot *tgbotapi.BotAPI, chatID int64, secret types.TelegramSec
 		generateKeyboard(entryData, secret),
 	)
 	bot.Send(msg)
-}
-
-// EscapeText takes an input text and escape Telegram markup symbols.
-// In this way we can send a text without being afraid of having to escape the characters manually.
-// Note that you don't have to include the formatting style in the input text, or it will be escaped too.
-// If there is an error, an empty string will be returned.
-//
-// parseMode is the text formatting mode (ModeMarkdown, ModeMarkdownV2 or ModeHTML)
-// text is the input string that will be escaped
-func escapeText(parseMode string, text string) string {
-	var replacer *strings.Replacer
-
-	if parseMode == "ModeHTML" {
-		replacer = strings.NewReplacer("<", "&lt;", ">", "&gt;", "&", "&amp;")
-	} else if parseMode == "ModeMarkdown" {
-		replacer = strings.NewReplacer("_", "\\_", "*", "\\*", "`", "\\`", "[", "\\[")
-	} else if parseMode == "ModeMarkdownV2" {
-		replacer = strings.NewReplacer(
-			"_", "\\_", "*", "\\*", "[", "\\[", "]", "\\]", "(",
-			"\\(", ")", "\\)", "~", "\\~", "`", "\\`", ">", "\\>",
-			"#", "\\#", "+", "\\+", "-", "\\-", "=", "\\=", "|",
-			"\\|", "{", "\\{", "}", "\\}", ".", "\\.", "!", "\\!",
-		)
-	} else {
-		return ""
-	}
-
-	return replacer.Replace(text)
 }
 
 // Check whether the CategoryID is in our ignored list
