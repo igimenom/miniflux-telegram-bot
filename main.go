@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api"
@@ -35,10 +36,12 @@ var (
 	commit  = "00000000"
 	date    = "unknown"
 
-	reBlockquote = regexp.MustCompile(`(?is)<blockquote[^>]*>(.*?)</blockquote>`)
-	reBoldMD     = regexp.MustCompile(`\*\*(.+?)\*\*`)
-	reHTMLTags   = regexp.MustCompile(`<[^>]+>`)
-	reSpaces     = regexp.MustCompile(`[ \t]{2,}`)
+	reBlockquote  = regexp.MustCompile(`(?is)<blockquote[^>]*>(.*?)</blockquote>`)
+	reHTMLTags    = regexp.MustCompile(`<[^>]+>`)
+	reMDHeaders   = regexp.MustCompile(`(?m)^#{1,6}\s*`)
+	reBoldMD      = regexp.MustCompile(`\*\*(.+?)\*\*`)
+	reIntroPrefix = regexp.MustCompile(`(?i)^(resumen en español|resumen de la noticia|resumen)\s*:?\s*`)
+	reSpaces      = regexp.MustCompile(`\s+`)
 )
 
 //go:embed migrations/*.sql
@@ -47,6 +50,12 @@ var embedMigrations embed.FS
 type pendingEntry struct {
 	id       int64
 	firstSaw time.Time
+}
+
+type botState struct {
+	mu            sync.RWMutex
+	pending       []pendingEntry
+	latestEntryID int64
 }
 
 func main() {
@@ -115,49 +124,68 @@ func main() {
 
 	slog.Info("Starting Miniflux Bot", "version", version, "built", date, "commit", commit[:8])
 
+	state := &botState{
+		latestEntryID: latestEntryID,
+	}
+
 	// Start listening for messages from Telegram
-	go listenForMessages(bot, chatID, telegramSecret, rss, store)
+	go listenForMessages(bot, chatID, telegramSecret, rss, store, state)
 
 	// Cleanup & update messages
 	if viper.GetBool("TELEGRAM_CLEANUP_MESSAGES") {
 		go updateMessages(bot, chatID, telegramSecret, rss, store)
 	}
 
-	var pending []pendingEntry
-
 	// Loop checking for new Miniflux entries and AI summaries
 	// TODO: If webhooks get added, change over to those
 	for {
-		entries, err := rss.Entries(&miniflux.Filter{Status: miniflux.EntryStatusUnread, Order: "id", AfterEntryID: latestEntryID})
+		state.mu.RLock()
+		currentLatestID := state.latestEntryID
+		state.mu.RUnlock()
+
+		entries, err := rss.Entries(&miniflux.Filter{Status: miniflux.EntryStatusUnread, Order: "id", AfterEntryID: currentLatestID})
 		if err != nil {
 			slog.Error("Failed getting entries", "error", err)
 		} else if entries.Total != 0 {
+			state.mu.Lock()
 			for _, entry := range entries.Entries {
-				latestEntryID = entry.ID
+				if entry.ID > state.latestEntryID {
+					state.latestEntryID = entry.ID
+				}
 				if ignoredCategoryID(entry.Feed.Category.ID) {
 					slog.Info("Skipping entry as it's in an ignored category", "entry", entry.ID)
 					continue
 				}
-				pending = append(pending, pendingEntry{
+				state.pending = append(state.pending, pendingEntry{
 					id:       entry.ID,
 					firstSaw: time.Now(),
 				})
 				slog.Info("Queued entry waiting for AI summary", "entry", entry.ID)
 			}
+			state.mu.Unlock()
 		}
 
 		// Evaluate pending entries waiting for AI summary
+		state.mu.RLock()
+		pendingSnapshot := make([]pendingEntry, len(state.pending))
+		copy(pendingSnapshot, state.pending)
+		state.mu.RUnlock()
+
 		var stillPending []pendingEntry
-		for _, item := range pending {
+		for _, item := range pendingSnapshot {
 			freshEntry, err := rss.Entry(item.id)
 			if err != nil {
+				if strings.Contains(err.Error(), "resource not found") {
+					slog.Info("Pending entry no longer exists in Miniflux, dropping from queue", "entry", item.id)
+					continue
+				}
 				slog.Error("Failed refreshing pending entry", "error", err, "entry", item.id)
 				stillPending = append(stillPending, item)
 				continue
 			}
 
 			hasSummary := reBlockquote.MatchString(freshEntry.Content)
-			timedOut := time.Since(item.firstSaw) >= 10*time.Minute
+			timedOut := time.Since(item.firstSaw) >= 30*time.Minute
 
 			if hasSummary || timedOut {
 				if !hasSummary && timedOut {
@@ -173,7 +201,10 @@ func main() {
 				stillPending = append(stillPending, item)
 			}
 		}
-		pending = stillPending
+
+		state.mu.Lock()
+		state.pending = stillPending
+		state.mu.Unlock()
 
 		sleepSec := viper.GetInt64("MINIFLUX_SLEEP_TIME")
 		if sleepSec < 5 {
@@ -183,7 +214,7 @@ func main() {
 	}
 }
 
-func listenForMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.TelegramSecret, rss *miniflux.Client, store store.Store) {
+func listenForMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.TelegramSecret, rss *miniflux.Client, store store.Store, state *botState) {
 	poll := tgbotapi.NewUpdate(0)
 	poll.Timeout = viper.GetInt("TELEGRAM_POLL_TIMEOUT")
 
@@ -209,7 +240,7 @@ func listenForMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.Telegram
 					continue
 				}
 				if len(unreadEntries.Entries) == 0 {
-					_ = sendText(bot, chatID, "No unread entries found.", false)
+					_ = sendText(bot, chatID, "No hay noticias sin leer.", false)
 					continue
 				}
 
@@ -217,11 +248,7 @@ func listenForMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.Telegram
 				if err := sendMsg(bot, chatID, secret, unreadEntries.Entries[rand.Intn(len(unreadEntries.Entries))], false, false, store); err != nil {
 					slog.Error("Failed sending message for random entry", "error", err)
 				}
-			case "start":
-				startMessage := fmt.Sprintf("Your Miniflux Bot is online! Running %v built %v (Commit %s)", version, date, commit[:8])
-				if err = sendText(bot, chatID, startMessage, false); err != nil {
-					slog.Error("Failed sending message for start command", "error", err)
-				}
+
 			case "unread":
 				limit := 5
 				arg := strings.TrimSpace(update.Message.CommandArguments())
@@ -250,7 +277,6 @@ func listenForMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.Telegram
 					continue
 				}
 
-				// Enviar de más antigua a más reciente dentro del lote
 				for i := len(unreadEntries.Entries) - 1; i >= 0; i-- {
 					entry := unreadEntries.Entries[i]
 					if err := sendMsg(bot, chatID, secret, entry, false, true, store); err != nil {
@@ -277,7 +303,82 @@ func listenForMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.Telegram
 				if err := sendMsg(bot, chatID, secret, entry, false, true, store); err != nil {
 					slog.Error("Failed resending entry", "error", err, "entry", entryID)
 				}
-			}
+
+			case "status":
+				state.mu.RLock()
+				pendingCount := len(state.pending)
+				lastID := state.latestEntryID
+				var oldestWait string
+				if pendingCount > 0 {
+					oldestWait = time.Since(state.pending[0].firstSaw).Round(time.Second).String()
+				}
+				state.mu.RUnlock()
+
+				unreadStats, err := rss.Entries(&miniflux.Filter{Status: miniflux.EntryStatusUnread, Limit: 1})
+				unreadTotal := -1
+				if err == nil {
+					unreadTotal = unreadStats.Total
+				}
+
+				var statusMsg strings.Builder
+				fmt.Fprintf(&statusMsg, "Estado del bot:\n")
+				fmt.Fprintf(&statusMsg, "- En cola esperando resumen IA: %d\n", pendingCount)
+				if pendingCount > 0 {
+					fmt.Fprintf(&statusMsg, "- Espera más antigua: %s\n", oldestWait)
+				}
+				fmt.Fprintf(&statusMsg, "- Último ID procesado: %d\n", lastID)
+				if unreadTotal >= 0 {
+					fmt.Fprintf(&statusMsg, "- Total sin leer en Miniflux: %d", unreadTotal)
+				}
+
+				if err := sendText(bot, chatID, statusMsg.String(), false); err != nil {
+					slog.Error("Failed sending status message", "error", err)
+				}
+
+			case "refresh":
+				if err := rss.RefreshAllFeeds(); err != nil {
+					slog.Error("Failed refreshing all feeds", "error", err)
+					_ = sendText(bot, chatID, "Error al solicitar la actualización de feeds en Miniflux.", false)
+				} else {
+					_ = sendText(bot, chatID, "Actualización de todos los feeds lanzada en Miniflux.", false)
+				}
+
+			case "search":
+				query := strings.TrimSpace(update.Message.CommandArguments())
+				if query == "" {
+					_ = sendText(bot, chatID, "Uso: /search <texto a buscar> (ej: /search nginx)", false)
+					continue
+				}
+
+				results, err := rss.Entries(&miniflux.Filter{
+					Search:    query,
+					Order:     "id",
+					Direction: "desc",
+					Limit:     5,
+				})
+				if err != nil {
+					slog.Error("Failed searching entries", "error", err, "query", query)
+					_ = sendText(bot, chatID, "Error al buscar en Miniflux.", false)
+					continue
+				}
+				if len(results.Entries) == 0 {
+					_ = sendText(bot, chatID, fmt.Sprintf("Sin resultados para \"%s\".", query), false)
+					continue
+				}
+
+				_ = sendText(bot, chatID, fmt.Sprintf("Mostrando %d de %d resultados para \"%s\":", len(results.Entries), results.Total, query), true)
+				for i := len(results.Entries) - 1; i >= 0; i-- {
+					if err := sendMsg(bot, chatID, secret, results.Entries[i], false, false, store); err != nil {
+						slog.Error("Failed sending search result", "error", err, "entry", results.Entries[i].ID)
+					}
+					time.Sleep(300 * time.Millisecond)
+				}
+
+			case "start":
+				startMessage := fmt.Sprintf("Your Miniflux Bot is online! Running %v built %v (Commit %s)", version, date, commit[:8])
+				if err = sendText(bot, chatID, startMessage, false); err != nil {
+					slog.Error("Failed sending message for start command", "error", err)
+				}
 			}
 		}
 
@@ -368,7 +469,12 @@ func updateMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.TelegramSec
 				// We can edit the message!
 				minifluxEntry, err := rss.Entry(entry.ID)
 				if err != nil {
-					slog.Error("Failed getting Miniflux entry", "error", err)
+					if strings.Contains(err.Error(), "resource not found") {
+						slog.Info("Entry no longer exists in Miniflux, removing from store", "entry", entry.ID)
+						_ = store.DeleteEntryByID(entry.ID)
+					} else {
+						slog.Error("Failed getting Miniflux entry", "error", err, "entry", entry.ID)
+					}
 					continue
 				}
 
@@ -463,21 +569,15 @@ func extractAISummary(content string) string {
 		return ""
 	}
 
-	// Decodifica entidades HTML como &#34; -> "
 	s := html.UnescapeString(match[1])
-
-	// Quita etiquetas HTML existentes (p, strong, etc.) dejando espacios limpios
 	s = reHTMLTags.ReplaceAllString(s, " ")
-
-	// Escapa caracteres especiales para HTML de Telegram
-	s = html.EscapeString(s)
-
-	// Convierte **negrita** en <b>negrita</b>
-	s = reBoldMD.ReplaceAllString(s, "<b>$1</b>")
-
-	// Limpia espacios múltiples y recorta
+	s = reMDHeaders.ReplaceAllString(s, "")
+	s = reBoldMD.ReplaceAllString(s, "$1")
+	s = strings.ReplaceAll(s, "###", " ")
 	s = reSpaces.ReplaceAllString(s, " ")
 	s = strings.TrimSpace(s)
+	s = reIntroPrefix.ReplaceAllString(s, "")
+	s = html.EscapeString(strings.TrimSpace(s))
 
 	runes := []rune(s)
 	if len(runes) > 2500 {
