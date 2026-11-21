@@ -222,6 +222,62 @@ func listenForMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.Telegram
 				if err = sendText(bot, chatID, startMessage, false); err != nil {
 					slog.Error("Failed sending message for start command", "error", err)
 				}
+			case "unread":
+				limit := 5
+				arg := strings.TrimSpace(update.Message.CommandArguments())
+				if arg != "" {
+					if n, err := strconv.Atoi(arg); err == nil && n > 0 {
+						limit = n
+						if limit > 20 {
+							limit = 20
+						}
+					}
+				}
+
+				unreadEntries, err := rss.Entries(&miniflux.Filter{
+					Status:    miniflux.EntryStatusUnread,
+					Order:     "id",
+					Direction: "desc",
+					Limit:     limit,
+				})
+				if err != nil {
+					slog.Error("Failed getting unread entries", "error", err)
+					_ = sendText(bot, chatID, "Error al consultar Miniflux.", false)
+					continue
+				}
+				if len(unreadEntries.Entries) == 0 {
+					_ = sendText(bot, chatID, "No tienes noticias sin leer.", false)
+					continue
+				}
+
+				// Enviar de más antigua a más reciente dentro del lote
+				for i := len(unreadEntries.Entries) - 1; i >= 0; i-- {
+					entry := unreadEntries.Entries[i]
+					if err := sendMsg(bot, chatID, secret, entry, false, true, store); err != nil {
+						slog.Error("Failed sending unread entry", "error", err, "entry", entry.ID)
+					}
+					time.Sleep(300 * time.Millisecond)
+				}
+
+			case "resend":
+				arg := strings.TrimSpace(update.Message.CommandArguments())
+				entryID, err := strconv.ParseInt(arg, 10, 64)
+				if err != nil || entryID <= 0 {
+					_ = sendText(bot, chatID, "Uso: /resend <ID_de_entrada> (ej: /resend 642)", false)
+					continue
+				}
+
+				entry, err := rss.Entry(entryID)
+				if err != nil {
+					slog.Error("Failed getting entry for resend", "error", err, "entry", entryID)
+					_ = sendText(bot, chatID, fmt.Sprintf("No se encontró la entrada %d en Miniflux.", entryID), false)
+					continue
+				}
+
+				if err := sendMsg(bot, chatID, secret, entry, false, true, store); err != nil {
+					slog.Error("Failed resending entry", "error", err, "entry", entryID)
+				}
+			}
 			}
 		}
 
