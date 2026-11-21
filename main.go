@@ -63,6 +63,7 @@ func main() {
 	viper.SetDefault("MINIFLUX_URL", "https://reader.miniflux.app")
 	viper.SetDefault("MINIFLUX_SLEEP_TIME", 10)
 	viper.SetDefault("TELEGRAM_CHAT_ID", 0)
+	viper.SetDefault("TELEGRAM_CHANNEL_ID", int64(0))
 	viper.SetDefault("TELEGRAM_POLL_TIMEOUT", 120)
 	viper.SetDefault("TELEGRAM_SILENT_NOTIFICATION", true)
 	viper.SetDefault("TELEGRAM_CLEANUP_MESSAGES", true)
@@ -82,12 +83,13 @@ func main() {
 	// Pass migrations to storage
 	sqlite.EmbedMigrations = embedMigrations
 
-	// Set ChatID
+	// Set ChatID and optional ChannelID
 	chatID := viper.GetInt64("TELEGRAM_CHAT_ID")
 	if chatID == 0 {
 		slog.Error("TELEGRAM_CHAT_ID is not set")
 		os.Exit(1)
 	}
+	channelID := viper.GetInt64("TELEGRAM_CHANNEL_ID")
 
 	// Check secret is set and valid
 	telegramSecret, err := parse.TelegramSecret(viper.GetString("TELEGRAM_SECRET"))
@@ -122,7 +124,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	slog.Info("Starting Miniflux Bot", "version", version, "built", date, "commit", commit[:8])
+	slog.Info("Starting Miniflux Bot", "version", version, "built", date, "commit", commit[:8], "channel_id", channelID)
 
 	state := &botState{
 		latestEntryID: latestEntryID,
@@ -191,11 +193,15 @@ func main() {
 				if !hasSummary && timedOut {
 					slog.Warn("Timeout waiting for AI summary, sending entry anyway", "entry", freshEntry.ID)
 				}
-				if err := sendMsg(bot, chatID, telegramSecret, freshEntry, viper.GetBool("TELEGRAM_SILENT_NOTIFICATION"), true, store); err != nil {
+				silent := viper.GetBool("TELEGRAM_SILENT_NOTIFICATION")
+				if err := sendMsg(bot, chatID, telegramSecret, freshEntry, silent, true, store); err != nil {
 					slog.Error("Failed sending message", "error", err, "entry", freshEntry.ID)
 					stillPending = append(stillPending, item)
 				} else {
 					slog.Info("Message sent for entry", "entry", freshEntry.ID)
+					if err := sendChannelMsg(bot, channelID, freshEntry, silent); err != nil {
+						slog.Error("Failed sending message to channel", "error", err, "entry", freshEntry.ID, "channel", channelID)
+					}
 				}
 			} else {
 				stillPending = append(stillPending, item)
@@ -244,7 +250,6 @@ func listenForMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.Telegram
 					continue
 				}
 
-				// Select a random entry from the list
 				if err := sendMsg(bot, chatID, secret, unreadEntries.Entries[rand.Intn(len(unreadEntries.Entries))], false, false, store); err != nil {
 					slog.Error("Failed sending message for random entry", "error", err)
 				}
@@ -384,7 +389,6 @@ func listenForMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.Telegram
 
 		// Check whether we've got a Callback Query
 		if update.CallbackQuery != nil {
-
 			// Double check if the callback is from our expected chat
 			if update.CallbackQuery.From.ID != int(chatID) {
 				slog.Warn("Callback from unexpected chat ID, ignoring", "chat_id", update.CallbackQuery.From.ID)
@@ -392,7 +396,6 @@ func listenForMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.Telegram
 			}
 
 			var entryID int64
-			// Split our string
 			callback := strings.Split(update.CallbackQuery.Data, ":")
 
 			// Check our secret
@@ -454,10 +457,8 @@ func listenForMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.Telegram
 
 func updateMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.TelegramSecret, rss *miniflux.Client, store store.Store) {
 	for {
-		// Set current time so we know when messages are too old to remove
 		currentTime := time.Now()
 
-		// Get all our entries
 		entries, err := store.GetEntries()
 		if err != nil {
 			slog.Error("Failed getting saved entries", "error", err)
@@ -465,8 +466,6 @@ func updateMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.TelegramSec
 
 		for _, entry := range entries {
 			if currentTime.Sub(entry.SentTime).Hours() < 48 {
-
-				// We can edit the message!
 				minifluxEntry, err := rss.Entry(entry.ID)
 				if err != nil {
 					if strings.Contains(err.Error(), "resource not found") {
@@ -478,20 +477,17 @@ func updateMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.TelegramSec
 					continue
 				}
 
-				// If we're read, were updated > 2 hours ago and set to delete it, cleanup the message
 				if (minifluxEntry.Status == "read") && (currentTime.Sub(minifluxEntry.ChangedAt).Hours() > 2) && entry.DeleteRead {
 					_, err := bot.DeleteMessage(tgbotapi.NewDeleteMessage(chatID, entry.TelegramID))
 					slog.Info("Deleting message for read entry", "entry", entry.ID)
 					if err != nil {
 						slog.Error("Failed deleting message in Telegram", "error", err)
 					}
-					// Cleanup entry in DB
 					err = store.DeleteEntryByID(entry.ID)
 					if err != nil {
 						slog.Error("Error deleting entry in storage", "error", err)
 					}
 				} else if minifluxEntry.ChangedAt.Truncate(time.Second).After(entry.UpdatedTime) {
-					// If entry has been updated in Miniflux (marked as read, starred etc) update Telegram keyboard
 					slog.Info("Updating keyboard for entry", "entry", entry.ID)
 					updateKeyboard(bot, chatID, secret, rss, entry.TelegramID, entry.ID)
 					err := store.UpdateEntryTime(entry.ID, minifluxEntry.ChangedAt)
@@ -500,7 +496,6 @@ func updateMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.TelegramSec
 					}
 				}
 			} else {
-				// Cleanup the DB entry since there is nothing we can do with it
 				if err := store.DeleteEntryByID(entry.ID); err != nil {
 					slog.Error("Error deleting entry in storage", "error", err)
 				} else {
@@ -509,7 +504,6 @@ func updateMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.TelegramSec
 			}
 		}
 
-		// Sleep for 10 minutes until we check again
 		time.Sleep(10 * time.Minute)
 	}
 }
@@ -521,7 +515,7 @@ func sendText(bot *tgbotapi.BotAPI, chatID int64, msgStr string, silentMessage b
 	return err
 }
 
-func sendMsg(bot *tgbotapi.BotAPI, chatID int64, secret types.TelegramSecret, entry *miniflux.Entry, silentMessage bool, deleteRead bool, store store.Store) error {
+func buildEntryMessage(entry *miniflux.Entry) string {
 	summary := extractAISummary(entry.Content)
 
 	var sb strings.Builder
@@ -539,8 +533,11 @@ func sendMsg(bot *tgbotapi.BotAPI, chatID int64, secret types.TelegramSecret, en
 	if len(runes) > 4000 {
 		msgText = string(runes[:4000]) + "…"
 	}
+	return msgText
+}
 
-	msg := tgbotapi.NewMessage(chatID, msgText)
+func sendMsg(bot *tgbotapi.BotAPI, chatID int64, secret types.TelegramSecret, entry *miniflux.Entry, silentMessage bool, deleteRead bool, store store.Store) error {
+	msg := tgbotapi.NewMessage(chatID, buildEntryMessage(entry))
 	msg.ReplyMarkup = generateKeyboard(entry, secret)
 	msg.ParseMode = "HTML"
 	msg.DisableNotification = silentMessage
@@ -549,18 +546,25 @@ func sendMsg(bot *tgbotapi.BotAPI, chatID int64, secret types.TelegramSecret, en
 		return err
 	}
 
-	// Save our message
 	var messageEntry models.Message
 	messageEntry.ID = entry.ID
 	messageEntry.TelegramID = message.MessageID
 	messageEntry.SentTime = message.Time()
 	messageEntry.UpdatedTime = entry.ChangedAt
 	messageEntry.DeleteRead = deleteRead
-	if err := store.InsertEntry(messageEntry); err != nil {
-		return err
+	return store.InsertEntry(messageEntry)
+}
+
+func sendChannelMsg(bot *tgbotapi.BotAPI, channelID int64, entry *miniflux.Entry, silentMessage bool) error {
+	if channelID == 0 {
+		return nil
 	}
 
-	return nil
+	msg := tgbotapi.NewMessage(channelID, buildEntryMessage(entry))
+	msg.ParseMode = "HTML"
+	msg.DisableNotification = silentMessage
+	_, err := bot.Send(msg)
+	return err
 }
 
 func extractAISummary(content string) string {
@@ -630,14 +634,12 @@ func answerCallback(bot *tgbotapi.BotAPI, queryID string, reply string) {
 }
 
 func updateKeyboard(bot *tgbotapi.BotAPI, chatID int64, secret types.TelegramSecret, rss *miniflux.Client, messageID int, entry int64) {
-	// Get latest entry data
 	entryData, err := rss.Entry(entry)
 	if err != nil {
 		slog.Error("Error updating keyboard", "error", err)
 		return
 	}
 
-	// Generate new keyboard data
 	msg := tgbotapi.NewEditMessageReplyMarkup(
 		chatID,
 		messageID,
@@ -646,7 +648,6 @@ func updateKeyboard(bot *tgbotapi.BotAPI, chatID int64, secret types.TelegramSec
 	_, _ = bot.Send(msg)
 }
 
-// Check whether the CategoryID is in our ignored list
 func ignoredCategoryID(categoryID int64) bool {
 	ignoredCategories := viper.GetStringSlice("MINIFLUX_IGNORED_CATEGORIES")
 	for _, ignoredCategory := range ignoredCategories {
