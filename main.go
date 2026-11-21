@@ -44,10 +44,15 @@ var (
 //go:embed migrations/*.sql
 var embedMigrations embed.FS
 
+type pendingEntry struct {
+	id       int64
+	firstSaw time.Time
+}
+
 func main() {
 	// Get config
 	viper.SetDefault("MINIFLUX_URL", "https://reader.miniflux.app")
-	viper.SetDefault("MINIFLUX_SLEEP_TIME", 30)
+	viper.SetDefault("MINIFLUX_SLEEP_TIME", 10)
 	viper.SetDefault("TELEGRAM_CHAT_ID", 0)
 	viper.SetDefault("TELEGRAM_POLL_TIMEOUT", 120)
 	viper.SetDefault("TELEGRAM_SILENT_NOTIFICATION", true)
@@ -93,7 +98,10 @@ func main() {
 	}
 
 	// Set latest entry
-	latestEntryID := latestEntries.Entries[0].ID
+	var latestEntryID int64
+	if len(latestEntries.Entries) > 0 {
+		latestEntryID = latestEntries.Entries[0].ID
+	}
 
 	// Get our DB going
 	store := sqlite.New()
@@ -115,31 +123,63 @@ func main() {
 		go updateMessages(bot, chatID, telegramSecret, rss, store)
 	}
 
-	// Loop checking for new Miniflux entries
+	var pending []pendingEntry
+
+	// Loop checking for new Miniflux entries and AI summaries
 	// TODO: If webhooks get added, change over to those
 	for {
 		entries, err := rss.Entries(&miniflux.Filter{Status: miniflux.EntryStatusUnread, Order: "id", AfterEntryID: latestEntryID})
-
 		if err != nil {
 			slog.Error("Failed getting entries", "error", err)
-		} else {
-			if entries.Total != 0 {
-				for _, entry := range entries.Entries {
-					latestEntryID = entry.ID
-					if ignoredCategoryID(entry.Feed.Category.ID) {
-						slog.Info("Skipping entry as it's in an ignored category", "entry", entry.ID)
-						continue
-					} else {
-						if err := sendMsg(bot, chatID, telegramSecret, entry, viper.GetBool("TELEGRAM_SILENT_NOTIFICATION"), true, store); err != nil {
-							slog.Error("Failed sending message", "error", err, "entry", entry.ID)
-						} else {
-							slog.Info("Message sent for entry", "entry", entry.ID)
-						}
-					}
+		} else if entries.Total != 0 {
+			for _, entry := range entries.Entries {
+				latestEntryID = entry.ID
+				if ignoredCategoryID(entry.Feed.Category.ID) {
+					slog.Info("Skipping entry as it's in an ignored category", "entry", entry.ID)
+					continue
 				}
+				pending = append(pending, pendingEntry{
+					id:       entry.ID,
+					firstSaw: time.Now(),
+				})
+				slog.Info("Queued entry waiting for AI summary", "entry", entry.ID)
 			}
 		}
-		time.Sleep(time.Duration(viper.GetInt64("MINIFLUX_SLEEP_TIME")) * time.Minute)
+
+		// Evaluate pending entries waiting for AI summary
+		var stillPending []pendingEntry
+		for _, item := range pending {
+			freshEntry, err := rss.Entry(item.id)
+			if err != nil {
+				slog.Error("Failed refreshing pending entry", "error", err, "entry", item.id)
+				stillPending = append(stillPending, item)
+				continue
+			}
+
+			hasSummary := reBlockquote.MatchString(freshEntry.Content)
+			timedOut := time.Since(item.firstSaw) >= 10*time.Minute
+
+			if hasSummary || timedOut {
+				if !hasSummary && timedOut {
+					slog.Warn("Timeout waiting for AI summary, sending entry anyway", "entry", freshEntry.ID)
+				}
+				if err := sendMsg(bot, chatID, telegramSecret, freshEntry, viper.GetBool("TELEGRAM_SILENT_NOTIFICATION"), true, store); err != nil {
+					slog.Error("Failed sending message", "error", err, "entry", freshEntry.ID)
+					stillPending = append(stillPending, item)
+				} else {
+					slog.Info("Message sent for entry", "entry", freshEntry.ID)
+				}
+			} else {
+				stillPending = append(stillPending, item)
+			}
+		}
+		pending = stillPending
+
+		sleepSec := viper.GetInt64("MINIFLUX_SLEEP_TIME")
+		if sleepSec < 5 {
+			sleepSec = 5
+		}
+		time.Sleep(time.Duration(sleepSec) * time.Second)
 	}
 }
 
@@ -166,6 +206,11 @@ func listenForMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.Telegram
 				unreadEntries, err := rss.Entries(&miniflux.Filter{Status: miniflux.EntryStatusUnread})
 				if err != nil {
 					slog.Error("Failed getting unread entries from Miniflux", "error", err)
+					continue
+				}
+				if len(unreadEntries.Entries) == 0 {
+					_ = sendText(bot, chatID, "No unread entries found.", false)
+					continue
 				}
 
 				// Select a random entry from the list
@@ -228,18 +273,18 @@ func listenForMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.Telegram
 				if err := rss.UpdateEntries([]int64{entryID}, "read"); err != nil {
 					answerCallback(bot, update.CallbackQuery.ID, "Error marking entry as read")
 				} else {
-					bot.DeleteMessage(tgbotapi.NewDeleteMessage(chatID, update.CallbackQuery.Message.MessageID))
-					store.DeleteEntryByID(entryID)
+					_, _ = bot.DeleteMessage(tgbotapi.NewDeleteMessage(chatID, update.CallbackQuery.Message.MessageID))
+					_ = store.DeleteEntryByID(entryID)
 					answerCallback(bot, update.CallbackQuery.ID, "Deleted message & marked as read")
 				}
 			case deleteMessage:
-				bot.DeleteMessage(tgbotapi.NewDeleteMessage(chatID, update.CallbackQuery.Message.MessageID))
-				store.DeleteEntryByTelegramID(update.CallbackQuery.Message.MessageID)
+				_, _ = bot.DeleteMessage(tgbotapi.NewDeleteMessage(chatID, update.CallbackQuery.Message.MessageID))
+				_ = store.DeleteEntryByTelegramID(update.CallbackQuery.Message.MessageID)
 				answerCallback(bot, update.CallbackQuery.ID, "Deleted message")
 			case star:
 				if err := rss.ToggleBookmark(entryID); err != nil {
 					answerCallback(bot, update.CallbackQuery.ID, "Error updating Miniflux entry")
-					fmt.Printf("Erorr talking to Miniflux: %v\n", err)
+					fmt.Printf("Error talking to Miniflux: %v\n", err)
 				} else {
 					go answerCallback(bot, update.CallbackQuery.ID, "Updated entry")
 					go updateKeyboard(bot, chatID, secret, rss, update.CallbackQuery.Message.MessageID, entryID)
@@ -252,7 +297,7 @@ func listenForMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.Telegram
 
 func updateMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.TelegramSecret, rss *miniflux.Client, store store.Store) {
 	for {
-		// Set current time so we know when messages are to old to remove
+		// Set current time so we know when messages are too old to remove
 		currentTime := time.Now()
 
 		// Get all our entries
@@ -285,8 +330,6 @@ func updateMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.TelegramSec
 					}
 				} else if minifluxEntry.ChangedAt.Truncate(time.Second).After(entry.UpdatedTime) {
 					// If entry has been updated in Miniflux (marked as read, starred etc) update Telegram keyboard
-					// Note: We're required to truncate Miniflux's time since it stores it down to the millisecond which the bot doesn't
-					// Without truncating it its always seen as "after" so we constantly update
 					slog.Info("Updating keyboard for entry", "entry", entry.ID)
 					updateKeyboard(bot, chatID, secret, rss, entry.TelegramID, entry.ID)
 					err := store.UpdateEntryTime(entry.ID, minifluxEntry.ChangedAt)
@@ -305,7 +348,7 @@ func updateMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.TelegramSec
 		}
 
 		// Sleep for 10 minutes until we check again
-		time.Sleep(time.Duration(10 * time.Minute))
+		time.Sleep(10 * time.Minute)
 	}
 }
 
@@ -373,7 +416,7 @@ func extractAISummary(content string) string {
 	// Escapa caracteres especiales para HTML de Telegram
 	s = html.EscapeString(s)
 
-	// Convierte **negrita** en <b>negrita</b> (reEscapedBold evita que escape interno rompa los asteriscos)
+	// Convierte **negrita** en <b>negrita</b>
 	s = reBoldMD.ReplaceAllString(s, "<b>$1</b>")
 
 	// Limpia espacios múltiples y recorta
@@ -422,7 +465,7 @@ func generateKeyboard(entry *miniflux.Entry, secret types.TelegramSecret) tgbota
 }
 
 func answerCallback(bot *tgbotapi.BotAPI, queryID string, reply string) {
-	bot.AnswerCallbackQuery(
+	_, _ = bot.AnswerCallbackQuery(
 		tgbotapi.CallbackConfig{
 			CallbackQueryID: queryID,
 			Text:            reply,
@@ -435,6 +478,7 @@ func updateKeyboard(bot *tgbotapi.BotAPI, chatID int64, secret types.TelegramSec
 	entryData, err := rss.Entry(entry)
 	if err != nil {
 		slog.Error("Error updating keyboard", "error", err)
+		return
 	}
 
 	// Generate new keyboard data
@@ -443,7 +487,7 @@ func updateKeyboard(bot *tgbotapi.BotAPI, chatID int64, secret types.TelegramSec
 		messageID,
 		generateKeyboard(entryData, secret),
 	)
-	bot.Send(msg)
+	_, _ = bot.Send(msg)
 }
 
 // Check whether the CategoryID is in our ignored list
