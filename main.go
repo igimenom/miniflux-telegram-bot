@@ -233,11 +233,16 @@ func listenForMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.Telegram
 
 	for update := range updates {
 		// Check whether we're a command
+		// Check whether we're a command
 		if update.Message != nil && update.Message.IsCommand() {
-			if allowed_username != "" && update.Message.From.UserName != allowed_username {
+			replyChatID := update.Message.Chat.ID
+
+			// Solo aplica allowed_username en tu chat privado; en grupos permite a los miembros usar comandos
+			if replyChatID == chatID && allowed_username != "" && update.Message.From.UserName != allowed_username {
 				slog.Error("Received command from invalid user", slog.String("user", update.Message.From.UserName))
 				continue
 			}
+
 			switch update.Message.Command() {
 			case "randomunread":
 				unreadEntries, err := rss.Entries(&miniflux.Filter{Status: miniflux.EntryStatusUnread})
@@ -246,11 +251,11 @@ func listenForMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.Telegram
 					continue
 				}
 				if len(unreadEntries.Entries) == 0 {
-					_ = sendText(bot, chatID, "No hay noticias sin leer.", false)
+					_ = sendText(bot, replyChatID, "No hay noticias sin leer.", false)
 					continue
 				}
 
-				if err := sendMsg(bot, chatID, secret, unreadEntries.Entries[rand.Intn(len(unreadEntries.Entries))], false, false, store); err != nil {
+				if err := sendMsg(bot, replyChatID, secret, unreadEntries.Entries[rand.Intn(len(unreadEntries.Entries))], false, false, store); err != nil {
 					slog.Error("Failed sending message for random entry", "error", err)
 				}
 
@@ -274,17 +279,17 @@ func listenForMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.Telegram
 				})
 				if err != nil {
 					slog.Error("Failed getting unread entries", "error", err)
-					_ = sendText(bot, chatID, "Error al consultar Miniflux.", false)
+					_ = sendText(bot, replyChatID, "Error al consultar Miniflux.", false)
 					continue
 				}
 				if len(unreadEntries.Entries) == 0 {
-					_ = sendText(bot, chatID, "No tienes noticias sin leer.", false)
+					_ = sendText(bot, replyChatID, "No tienes noticias sin leer.", false)
 					continue
 				}
 
 				for i := len(unreadEntries.Entries) - 1; i >= 0; i-- {
 					entry := unreadEntries.Entries[i]
-					if err := sendMsg(bot, chatID, secret, entry, false, true, store); err != nil {
+					if err := sendMsg(bot, replyChatID, secret, entry, false, true, store); err != nil {
 						slog.Error("Failed sending unread entry", "error", err, "entry", entry.ID)
 					}
 					time.Sleep(300 * time.Millisecond)
@@ -294,18 +299,18 @@ func listenForMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.Telegram
 				arg := strings.TrimSpace(update.Message.CommandArguments())
 				entryID, err := strconv.ParseInt(arg, 10, 64)
 				if err != nil || entryID <= 0 {
-					_ = sendText(bot, chatID, "Uso: /resend <ID_de_entrada> (ej: /resend 642)", false)
+					_ = sendText(bot, replyChatID, "Uso: /resend <ID_de_entrada> (ej: /resend 642)", false)
 					continue
 				}
 
 				entry, err := rss.Entry(entryID)
 				if err != nil {
 					slog.Error("Failed getting entry for resend", "error", err, "entry", entryID)
-					_ = sendText(bot, chatID, fmt.Sprintf("No se encontró la entrada %d en Miniflux.", entryID), false)
+					_ = sendText(bot, replyChatID, fmt.Sprintf("No se encontró la entrada %d en Miniflux.", entryID), false)
 					continue
 				}
 
-				if err := sendMsg(bot, chatID, secret, entry, false, true, store); err != nil {
+				if err := sendMsg(bot, replyChatID, secret, entry, false, true, store); err != nil {
 					slog.Error("Failed resending entry", "error", err, "entry", entryID)
 				}
 
@@ -336,22 +341,22 @@ func listenForMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.Telegram
 					fmt.Fprintf(&statusMsg, "- Total sin leer en Miniflux: %d", unreadTotal)
 				}
 
-				if err := sendText(bot, chatID, statusMsg.String(), false); err != nil {
+				if err := sendText(bot, replyChatID, statusMsg.String(), false); err != nil {
 					slog.Error("Failed sending status message", "error", err)
 				}
 
 			case "refresh":
 				if err := rss.RefreshAllFeeds(); err != nil {
 					slog.Error("Failed refreshing all feeds", "error", err)
-					_ = sendText(bot, chatID, "Error al solicitar la actualización de feeds en Miniflux.", false)
+					_ = sendText(bot, replyChatID, "Error al solicitar la actualización de feeds en Miniflux.", false)
 				} else {
-					_ = sendText(bot, chatID, "Actualización de todos los feeds lanzada en Miniflux.", false)
+					_ = sendText(bot, replyChatID, "Actualización de todos los feeds lanzada en Miniflux.", false)
 				}
 
 			case "search":
 				query := strings.TrimSpace(update.Message.CommandArguments())
 				if query == "" {
-					_ = sendText(bot, chatID, "Uso: /search <texto a buscar> (ej: /search nginx)", false)
+					_ = sendText(bot, replyChatID, "Uso: /search <texto a buscar> (ej: /search nginx)", false)
 					continue
 				}
 
@@ -363,17 +368,17 @@ func listenForMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.Telegram
 				})
 				if err != nil {
 					slog.Error("Failed searching entries", "error", err, "query", query)
-					_ = sendText(bot, chatID, "Error al buscar en Miniflux.", false)
+					_ = sendText(bot, replyChatID, "Error al buscar en Miniflux.", false)
 					continue
 				}
 				if len(results.Entries) == 0 {
-					_ = sendText(bot, chatID, fmt.Sprintf("Sin resultados para \"%s\".", query), false)
+					_ = sendText(bot, replyChatID, fmt.Sprintf("Sin resultados para \"%s\".", query), false)
 					continue
 				}
 
-				_ = sendText(bot, chatID, fmt.Sprintf("Mostrando %d de %d resultados para \"%s\":", len(results.Entries), results.Total, query), true)
+				_ = sendText(bot, replyChatID, fmt.Sprintf("Mostrando %d de %d resultados para \"%s\":", len(results.Entries), results.Total, query), true)
 				for i := len(results.Entries) - 1; i >= 0; i-- {
-					if err := sendMsg(bot, chatID, secret, results.Entries[i], false, false, store); err != nil {
+					if err := sendMsg(bot, replyChatID, secret, results.Entries[i], false, false, store); err != nil {
 						slog.Error("Failed sending search result", "error", err, "entry", results.Entries[i].ID)
 					}
 					time.Sleep(300 * time.Millisecond)
@@ -381,7 +386,7 @@ func listenForMessages(bot *tgbotapi.BotAPI, chatID int64, secret types.Telegram
 
 			case "start":
 				startMessage := fmt.Sprintf("Your Miniflux Bot is online! Running %v built %v (Commit %s)", version, date, commit[:8])
-				if err = sendText(bot, chatID, startMessage, false); err != nil {
+				if err = sendText(bot, replyChatID, startMessage, false); err != nil {
 					slog.Error("Failed sending message for start command", "error", err)
 				}
 			}
